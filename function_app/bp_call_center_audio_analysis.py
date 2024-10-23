@@ -6,6 +6,9 @@ from typing import Optional
 
 
 import azure.functions as func
+from azure.cosmos import CosmosClient, exceptions
+import datetime
+import uuid
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI, AzureOpenAI
 from pydantic import BaseModel, Field
@@ -31,6 +34,10 @@ AOAI_LLM_DEPLOYMENT = os.getenv("AOAI_LLM_DEPLOYMENT")
 AOAI_WHISPER_DEPLOYMENT = os.getenv("AOAI_WHISPER_DEPLOYMENT")
 AOAI_ENDPOINT = os.getenv("AOAI_ENDPOINT")
 AOAI_API_KEY = os.getenv("AOAI_API_KEY")
+COSMOS_DB_ENDPOINT = os.getenv("COSMOS_DB_ENDPOINT")
+COSMOS_DB_KEY = os.getenv("COSMOS_DB_KEY")
+COSMOS_DB_DATABASE = os.getenv("COSMOS_DB_DATABASE")
+COSMOS_DB_CONTAINER = os.getenv("COSMOS_DB_CONTAINER")
 
 ### Setup components
 aoai_whisper_async_client = AsyncAzureOpenAI(
@@ -97,6 +104,66 @@ CUSTOMER_SENTIMENT_VALUES = [e.value for e in CustomerSentimentEnum]
 
 
 # Setup a class for the raw keywords returned by the LLM, and then the enriched version (after we match the keywords to the transcription)
+class CosmosLogger:
+    def __init__(
+        self,
+        cosmos_endpoint: str,
+        cosmos_key: str,
+        database_name: str,
+        container_name: str,
+    ):
+        """
+        Initializes the CosmosLogger to interact with Cosmos DB.
+
+        Args:
+            cosmos_endpoint (str): Endpoint URL for Cosmos DB.
+            cosmos_key (str): API key for Cosmos DB.
+            database_name (str): Name of the Cosmos DB database.
+            container_name (str): Name of the Cosmos DB container.
+        """
+        self.client = CosmosClient(cosmos_endpoint, cosmos_key)
+        self.database_name = database_name
+        self.container_name = container_name
+        self.container = self._get_container()
+
+    def _get_container(self):
+        """
+        Retrieves the Cosmos DB container.
+
+        Returns:
+            ContainerProxy: The Cosmos DB container client.
+        """
+        try:
+            database = self.client.get_database_client(self.database_name)
+            container = database.get_container_client(self.container_name)
+            logging.info(f"Connected to Cosmos DB container: {self.container_name}")
+            return container
+        except exceptions.CosmosResourceNotFoundError:
+            logging.error(
+                f"Cosmos DB container '{self.container_name}' not found in database '{self.database_name}'."
+            )
+            raise
+
+    def log_document(self, data: dict):
+        """
+        Logs a dictionary document to Cosmos DB.
+
+        Args:
+            data (dict): The document to be logged.
+        """
+        logging.info("Logging the document to Cosmos DB.")
+        document = {
+            "id": str(uuid.uuid4()),
+            "data": data,
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+        }
+        try:
+            self.container.create_item(body=document)
+            logging.info("Document logged to Cosmos DB successfully.")
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error(f"Failed to log document to Cosmos DB: {e.message}")
+
+
 class RawKeyword(LLMResponseBaseModel):
     keyword: str = Field(
         description="A keyword extracted from the call. This should be a direct match to a word or phrase in the transcription without modification of the spelling or grammar.",
@@ -257,8 +324,7 @@ LLM_SYSTEM_PROMPT = (
     "Your task is to review a customer service call and extract all of the key information from the call recording.\n"
     f"{LLMRawResponseModel.get_prompt_json_example(include_preceding_json_instructions=True)}"
 )
-
-
+    
 @bp_call_center_audio_analysis.route(route=FUNCTION_ROUTE)
 async def call_center_audio_analysis(
     req: func.HttpRequest,
@@ -414,6 +480,23 @@ async def call_center_audio_analysis(
             **llm_structured_response_dict,
             keywords=processed_keywords,
         )
+        # Instantiate CosmosLogger
+        cosmos_logger = CosmosLogger(
+            cosmos_endpoint=os.getenv(
+                "COSMOS_DB_ENDPOINT"
+            ),  # Ensure this env variable is set
+            cosmos_key=os.getenv("COSMOS_DB_KEY"),  # Ensure this env variable is set
+            database_name=COSMOS_DB_DATABASE,
+            container_name=COSMOS_DB_CONTAINER,
+        )
+
+        # Log the output_model to Cosmos DB
+        try:
+            cosmos_logger.log_document(data=output_model.model_dump_json())
+        except Exception as e:
+            logging.error(f"Failed to log to Cosmos DB: {str(e)}")
+            # Decide whether to proceed or return an error
+            # Here, we'll proceed and return the response even if logging fails
         # All steps completed successfully, set success=True and return the final result
         output_model.success = True
         output_model.func_time_taken_secs = func_timer.stop()
